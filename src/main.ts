@@ -291,9 +291,16 @@ async function handleAutoApprove(agent: AgentInfo): Promise<void> {
 async function focusAgent(terminalId: string): Promise<void> {
   if (!terminalId) return;
   try {
-    await invoke("focus_tab", { terminal_id: terminalId });
-  } catch (e) {
-    console.error("Focus failed:", e);
+    const result = await invoke("focus_tab", { terminal_id: terminalId });
+    console.log("focus_tab result:", result);
+  } catch (e: any) {
+    console.error("focus_tab FAILED:", e);
+    // Show error visually so we can see it
+    const errEl = document.createElement("div");
+    errEl.style.cssText = "position:fixed;top:0;left:0;right:0;padding:8px;background:#f38ba8;color:#000;font-size:11px;z-index:999;";
+    errEl.textContent = `focus_tab error: ${e?.message || e}`;
+    document.body.appendChild(errEl);
+    setTimeout(() => errEl.remove(), 5000);
   }
 }
 
@@ -390,7 +397,12 @@ function createAgentEl(agent: AgentInfo): HTMLElement {
   const row = document.createElement("div");
   row.className = "agent-row";
   row.dataset.key = agentKey(agent);
-  row.addEventListener("click", () => focusAgent(agent.terminalId || ""));
+  // Store sessionId, look up terminalId at click time (it may not exist yet)
+  row.dataset.sessionId = agent.sessionId;
+  row.addEventListener("click", () => {
+    const a = agents.get(row.dataset.sessionId || "");
+    if (a?.terminalId) focusAgent(a.terminalId);
+  });
   updateAgentEl(row, agent);
   return row;
 }
@@ -427,8 +439,7 @@ function updateAgentEl(row: HTMLElement, agent: AgentInfo): void {
   if (currentHash !== stableHash) {
     row.innerHTML = newHtml;
     row.dataset.hash = stableHash;
-    // Re-attach click handler since innerHTML was replaced
-    row.onclick = () => focusAgent(agent.terminalId || "");
+    row.dataset.sessionId = agent.sessionId;
   } else {
     // Just update the time element
     const timeEl = row.querySelector(".agent-time");
@@ -502,8 +513,10 @@ function renderQueueList(queue: AgentInfo[]): void {
       .join("");
     // Attach click handlers
     for (const item of Array.from(queueListEl.querySelectorAll(".queue-item")) as HTMLElement[]) {
-      const tid = item.dataset.tid;
-      if (tid) item.addEventListener("click", () => focusAgent(tid));
+      item.addEventListener("click", () => {
+        const tid = item.dataset.tid;
+        if (tid) focusAgent(tid);
+      });
     }
   } else {
     queueSectionEl.classList.add("hidden");
