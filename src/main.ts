@@ -276,7 +276,7 @@ async function handleAutoApprove(agent: AgentInfo): Promise<void> {
   if (!agent.terminalId) return;
 
   try {
-    await invoke("send_input", { terminal_id: agent.terminalId, text: "y\n" });
+    await invoke("send_input", { terminalId: agent.terminalId, text: "y\n" });
     agent.autoApproveCount++;
     agent.state = "running";
     agent.stateChangedAt = Date.now();
@@ -291,7 +291,7 @@ async function handleAutoApprove(agent: AgentInfo): Promise<void> {
 async function focusAgent(terminalId: string): Promise<void> {
   if (!terminalId) return;
   try {
-    const result = await invoke("focus_tab", { terminal_id: terminalId });
+    const result = await invoke("focus_tab", { terminalId: terminalId });
     console.log("focus_tab result:", result);
   } catch (e: any) {
     console.error("focus_tab FAILED:", e);
@@ -314,7 +314,7 @@ async function focusNextWaiting(): Promise<void> {
   await focusAgent(next.terminalId);
   try {
     await invoke("play_sound", {
-      sound_type: next.state === "waiting-approval" ? "needs-approval" : "needs-input",
+      soundType: next.state === "waiting-approval" ? "needs-approval" : "needs-input",
     });
   } catch {
     // audio non-critical
