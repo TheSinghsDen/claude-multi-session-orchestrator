@@ -194,16 +194,15 @@ function processTabPoll(tabs: TerminalTab[]): void {
   for (const tab of tabs) {
     seenTerminals.add(tab.terminal_id);
 
-    // Check if ANY existing agent already owns this terminal (by terminalId or cwd match)
-    const existingAgent = Array.from(agents.values()).find(
-      (a) => a.terminalId === tab.terminal_id ||
-             (a.detectionMethod === "hook" && a.cwd === tab.working_directory)
+    // Check if an existing agent already owns this specific terminal by ID
+    const ownedByTermId = Array.from(agents.values()).find(
+      (a) => a.terminalId === tab.terminal_id
     );
-    if (existingAgent) {
-      existingAgent.terminalId = tab.terminal_id;
+    if (ownedByTermId) {
+      // Already tracked, just update the name if needed
       const titleName = nameFromTabTitle(tab.tab_name);
-      if (titleName && (existingAgent.name === agentNameFromCwd(existingAgent.cwd))) {
-        existingAgent.name = titleName;
+      if (titleName && (ownedByTermId.name === agentNameFromCwd(ownedByTermId.cwd))) {
+        ownedByTermId.name = titleName;
       }
       continue;
     }
@@ -248,12 +247,37 @@ function processTabPoll(tabs: TerminalTab[]): void {
 }
 
 function matchAgentsToTabs(tabs: TerminalTab[]): void {
+  // Build a set of terminalIds already claimed by any agent
+  const claimedTerminals = new Set<string>();
+  for (const agent of agents.values()) {
+    if (agent.terminalId) claimedTerminals.add(agent.terminalId);
+  }
+
   for (const agent of agents.values()) {
     if (agent.detectionMethod === "hook" && !agent.terminalId) {
-      const match = tabs.find((t) => t.working_directory === agent.cwd);
+      // Find tabs matching this agent's cwd that aren't already claimed
+      const cwdMatches = tabs.filter(
+        (t) => t.working_directory === agent.cwd && !claimedTerminals.has(t.terminal_id)
+      );
+
+      let match: TerminalTab | undefined;
+
+      if (cwdMatches.length === 1) {
+        match = cwdMatches[0];
+      } else if (cwdMatches.length > 1) {
+        // Ambiguous: multiple tabs with same cwd. Prefer the one that's
+        // actively running (Braille spinner), since the hook just fired
+        // meaning that session is working, not idle.
+        match = cwdMatches.find((t) => {
+          const state = classifyFromTitle(t.tab_name);
+          return state === "running";
+        }) || cwdMatches[0]; // fallback to first
+      }
+
       if (match) {
         agent.terminalId = match.terminal_id;
-        // Remove any duplicate poll entry for this terminal
+        claimedTerminals.add(match.terminal_id);
+        // Remove any duplicate poll entry
         const pollId = `poll-${match.terminal_id}`;
         if (agents.has(pollId)) {
           agents.delete(pollId);
