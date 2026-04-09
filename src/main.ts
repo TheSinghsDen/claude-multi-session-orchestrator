@@ -278,7 +278,7 @@ async function handleAutoApprove(agent: AgentInfo): Promise<void> {
   if (!agent.terminalId) return;
 
   try {
-    await invoke("send_input", { terminalId: agent.terminalId, text: "y\n" });
+    await invoke("send_input", { terminal_id: agent.terminalId, text: "y\n" });
     agent.autoApproveCount++;
     agent.state = "running";
     agent.stateChangedAt = Date.now();
@@ -298,9 +298,9 @@ async function focusNextWaiting(): Promise<void> {
   if (!next.terminalId) return;
 
   try {
-    await invoke("focus_tab", { terminalId: next.terminalId });
+    await invoke("focus_tab", { terminal_id: next.terminalId });
     await invoke("play_sound", {
-      soundType: next.state === "waiting-approval" ? "needs-approval" : "needs-input",
+      sound_type: next.state === "waiting-approval" ? "needs-approval" : "needs-input",
     });
   } catch (e) {
     console.error("Focus failed:", e);
@@ -463,7 +463,7 @@ function render(): void {
 (window as any)._focusAgent = async (terminalId: string) => {
   if (!terminalId) return;
   try {
-    await invoke("focus_tab", { terminalId });
+    await invoke("focus_tab", { terminal_id: terminalId });
   } catch (e) {
     console.error("Focus failed:", e);
   }
@@ -522,11 +522,44 @@ async function tick(): Promise<void> {
 
 // ── Start ──
 
+// ── Debug overlay (visible in the sidebar) ──
+
+const debugEl = document.createElement("div");
+debugEl.style.cssText = "position:fixed;bottom:40px;left:0;right:0;padding:4px 8px;font-size:9px;color:#fab387;background:rgba(0,0,0,0.8);z-index:999;max-height:80px;overflow:auto;white-space:pre-wrap;";
+document.body.appendChild(debugEl);
+
+function debugLog(msg: string): void {
+  const line = `${new Date().toLocaleTimeString()} ${msg}`;
+  debugEl.textContent = line + "\n" + (debugEl.textContent || "").split("\n").slice(0, 5).join("\n");
+}
+
 async function init(): Promise<void> {
-  await invoke("ensure_hook_dir");
-  render(); // Initial empty render
+  debugLog("init: starting...");
+  try {
+    await invoke("ensure_hook_dir");
+    debugLog("init: hook dir ready");
+  } catch (e) {
+    debugLog(`init: ensure_hook_dir FAILED: ${e}`);
+  }
+
+  // Test: can we call any Tauri command?
+  try {
+    const running = await invoke("check_ghostty_running");
+    debugLog(`init: ghostty running = ${running}`);
+  } catch (e) {
+    debugLog(`init: check_ghostty FAILED: ${e}`);
+  }
+
+  try {
+    const tabs = await invoke("list_ghostty_tabs");
+    debugLog(`init: found ${(tabs as any[]).length} tabs`);
+  } catch (e) {
+    debugLog(`init: list_tabs FAILED: ${e}`);
+  }
+
+  render();
   setInterval(tick, POLL_INTERVAL);
-  tick(); // First tick immediately
+  tick();
 }
 
 init();
