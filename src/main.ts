@@ -5,14 +5,7 @@
  * Manages agent state, renders the overlay, handles auto-approve.
  */
 
-declare function __TAURI_INVOKE__(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
-
-// Use Tauri's invoke directly (available in webview context)
-const invoke = (window as any).__TAURI_INTERNALS__?.invoke
-  ?? (async (cmd: string, args?: Record<string, unknown>) => {
-    // Fallback for dev: use fetch to Tauri IPC
-    return (window as any).__TAURI_INVOKE__?.(cmd, args);
-  });
+import { invoke } from "@tauri-apps/api/core";
 
 // ── Types ──
 
@@ -93,18 +86,20 @@ function agentNameFromCwd(cwd: string): string {
 
 // ── Tab title emoji → state ──
 
+// Claude Code uses Braille spinner characters while working, ✳ when idle
+// Full Braille spinner cycle: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ plus ⠐⠂
 const EMOJI_STATES: [string, AgentState][] = [
-  ["⏳", "running"],
-  ["⠐", "running"],
+  // Braille spinner = running (Claude is working)
+  ["⠋", "running"], ["⠙", "running"], ["⠹", "running"], ["⠸", "running"],
+  ["⠼", "running"], ["⠴", "running"], ["⠦", "running"], ["⠧", "running"],
+  ["⠇", "running"], ["⠏", "running"], ["⠐", "running"], ["⠂", "running"],
   ["⠒", "running"],
-  ["⠇", "running"],
-  ["⠋", "running"],
-  ["⠙", "running"],
-  ["⠸", "running"],
-  ["⠴", "running"],
-  ["⠦", "running"],
-  ["✳", "waiting-input"],
+  // Hourglass
+  ["⏳", "running"],
+  // Idle (Claude finished, waiting at prompt — not actively asking a question)
+  ["✳", "done"],
   ["🔔", "waiting-input"],
+  // Done
   ["⏸", "done"],
 ];
 
@@ -214,7 +209,7 @@ function processTabPoll(tabs: TerminalTab[]): void {
     }
 
     const state = classifyFromTitle(tab.tab_name);
-    if (state === "unknown" && !tab.tab_name.toLowerCase().includes("claude")) continue;
+    if (state === "unknown") continue; // Only show tabs we can classify via emoji
 
     const pollId = `poll-${tab.terminal_id}`;
     const existing = agents.get(pollId);
