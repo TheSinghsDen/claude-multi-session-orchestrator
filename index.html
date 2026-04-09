@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Claude Command Center</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@300;400;600&display=swap" rel="stylesheet" />
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div id="app">
+    <!-- Queue section (top — attention first) -->
+    <div id="queue-section" class="queue-section hidden">
+      <div class="section-label">attention queue</div>
+      <div id="queue-list"></div>
+    </div>
+
+    <!-- Agent list -->
+    <div id="agent-list" class="agent-list"></div>
+
+    <!-- Empty state -->
+    <div id="empty-state" class="empty-state">
+      <div class="empty-icon">⌘</div>
+      <div class="empty-title">No agents detected</div>
+      <div class="empty-desc">Open Claude Code in Ghostty and start a session. The command center will pick it up automatically.</div>
+    </div>
+
+    <!-- Summary footer -->
+    <div id="summary" class="summary">
+      <span id="stat-running" class="stat"><span class="dot dot-green"></span> 0 running</span>
+      <span id="stat-waiting" class="stat"><span class="dot dot-yellow"></span> 0 waiting</span>
+      <span id="stat-done" class="stat"><span class="dot dot-gray"></span> 0 done</span>
+    </div>
+
+    <!-- Keyboard hints -->
+    <div class="shortcuts">
+      <span><kbd>⌘1</kbd>-<kbd>9</kbd> jump</span>
+      <span><kbd>⌘⏎</kbd> approve</span>
+    </div>
+  </div>
+  <script type="module" src="/src/main.ts"></script>
+</body>
+</html>
