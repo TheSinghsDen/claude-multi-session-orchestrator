@@ -107,9 +107,18 @@ function classifyFromTitle(title: string): AgentState {
   for (const [emoji, state] of EMOJI_STATES) {
     if (title.includes(emoji)) return state;
   }
-  // Check if it looks like a Claude Code tab at all
-  if (title.toLowerCase().includes("claude")) return "unknown";
   return "unknown";
+}
+
+/** Extract a readable name from the tab title by stripping emoji prefix */
+function nameFromTabTitle(title: string): string {
+  // Strip leading emoji/Braille characters and whitespace
+  let name = title.replace(/^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠐⠂⠒⏳✳🔔⏸]+/, "").trim();
+  // If what's left is just "Claude Code", use the cwd-based name
+  if (!name || name === "Claude Code") return "";
+  // Truncate long names
+  if (name.length > 40) name = name.slice(0, 37) + "...";
+  return name;
 }
 
 // ── Auto-approve logic ──
@@ -215,9 +224,10 @@ function processTabPoll(tabs: TerminalTab[]): void {
     const existing = agents.get(pollId);
     const prevState = existing?.state;
 
+    const titleName = nameFromTabTitle(tab.tab_name);
     const agent: AgentInfo = existing || {
       sessionId: pollId,
-      name: agentNameFromCwd(tab.working_directory),
+      name: titleName || agentNameFromCwd(tab.working_directory),
       cwd: tab.working_directory,
       state,
       terminalId: tab.terminal_id,
@@ -227,6 +237,8 @@ function processTabPoll(tabs: TerminalTab[]): void {
       detectionMethod: "polling",
     };
 
+    // Update name from tab title (it can change as Claude works)
+    if (titleName) agent.name = titleName;
     agent.state = state === "unknown" ? agent.state : state;
     agent.terminalId = tab.terminal_id;
     agent.lastEventTime = now;
