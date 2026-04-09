@@ -613,6 +613,17 @@ async function tick(): Promise<void> {
 
 async function init(): Promise<void> {
   try { await invoke("ensure_hook_dir"); } catch { /* non-critical */ }
+
+  // Wire up drag bar
+  const dragBar = document.getElementById("drag-bar");
+  if (dragBar) {
+    dragBar.addEventListener("mousedown", async (e) => {
+      if (e.button === 0) {
+        try { await invoke("start_drag"); } catch { /* ignore */ }
+      }
+    });
+  }
+
   render();
   setInterval(tick, POLL_INTERVAL);
   tick();

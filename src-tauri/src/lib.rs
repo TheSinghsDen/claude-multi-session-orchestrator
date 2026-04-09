@@ -227,6 +227,11 @@ fn ensure_hook_dir() -> Result<(), String> {
     fs::create_dir_all("/tmp/cc-state").map_err(|e| format!("Failed to create hook dir: {}", e))
 }
 
+#[tauri::command]
+fn start_drag(window: tauri::WebviewWindow) -> Result<(), String> {
+    window.start_dragging().map_err(|e| format!("Drag failed: {}", e))
+}
+
 // ── App Setup ──
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -241,6 +246,7 @@ pub fn run() {
             play_sound,
             check_ghostty_running,
             ensure_hook_dir,
+            start_drag,
         ])
         .setup(|app| {
             // Position sidebar on the right edge of the screen

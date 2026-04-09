@@ -20,6 +20,8 @@
         "transparent": false,
         "alwaysOnTop": true,
         "visibleOnAllWorkspaces": true,
+        "dragDropEnabled": true,
+        "acceptFirstMouse": true,
         "x": 1500,
         "y": 0
       }
