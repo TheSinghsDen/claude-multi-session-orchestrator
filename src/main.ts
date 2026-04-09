@@ -194,15 +194,16 @@ function processTabPoll(tabs: TerminalTab[]): void {
   for (const tab of tabs) {
     seenTerminals.add(tab.terminal_id);
 
-    const hookAgent = Array.from(agents.values()).find(
-      (a) => a.detectionMethod === "hook" && a.cwd === tab.working_directory
+    // Check if ANY existing agent already owns this terminal (by terminalId or cwd match)
+    const existingAgent = Array.from(agents.values()).find(
+      (a) => a.terminalId === tab.terminal_id ||
+             (a.detectionMethod === "hook" && a.cwd === tab.working_directory)
     );
-    if (hookAgent) {
-      hookAgent.terminalId = tab.terminal_id;
-      // Also update name from tab title if hook agent has a generic name
+    if (existingAgent) {
+      existingAgent.terminalId = tab.terminal_id;
       const titleName = nameFromTabTitle(tab.tab_name);
-      if (titleName && (hookAgent.name === agentNameFromCwd(hookAgent.cwd))) {
-        hookAgent.name = titleName;
+      if (titleName && (existingAgent.name === agentNameFromCwd(existingAgent.cwd))) {
+        existingAgent.name = titleName;
       }
       continue;
     }
@@ -250,7 +251,14 @@ function matchAgentsToTabs(tabs: TerminalTab[]): void {
   for (const agent of agents.values()) {
     if (agent.detectionMethod === "hook" && !agent.terminalId) {
       const match = tabs.find((t) => t.working_directory === agent.cwd);
-      if (match) agent.terminalId = match.terminal_id;
+      if (match) {
+        agent.terminalId = match.terminal_id;
+        // Remove any duplicate poll entry for this terminal
+        const pollId = `poll-${match.terminal_id}`;
+        if (agents.has(pollId)) {
+          agents.delete(pollId);
+        }
+      }
     }
   }
 }
