@@ -90,10 +90,9 @@ tell application "Ghostty"
     repeat with t in every tab of w
       repeat with term in every terminal of t
         if id of term is "{}" then
-          select t
-          activate w
           focus term
-          return
+          activate
+          return "ok"
         end if
       end repeat
     end repeat

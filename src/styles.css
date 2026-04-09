@@ -38,6 +38,35 @@ body {
   height: 100vh;
 }
 
+/* ── Drag bar (window move handle) ── */
+
+.drag-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 6px 14px;
+  border-bottom: 1px solid var(--border);
+  cursor: grab;
+  -webkit-app-region: drag;
+}
+
+.drag-bar:active {
+  cursor: grabbing;
+}
+
+.drag-title {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: uppercase;
+  letter-spacing: 1px;
+}
+
+.drag-dots {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
 /* ── Queue section (attention-first, top) ── */
 
 .queue-section {

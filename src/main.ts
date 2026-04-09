@@ -63,7 +63,6 @@ const STALE_TIMEOUT = 5 * 60 * 1000;
 
 const agents = new Map<string, AgentInfo>();
 let ghosttyAvailable = false;
-let hooksActive = false;
 
 // ── DOM ──
 
@@ -84,22 +83,14 @@ function agentNameFromCwd(cwd: string): string {
   return parts[parts.length - 1] || "unknown";
 }
 
-// ── Tab title emoji → state ──
+// ── Tab title → state + name ──
 
-// Claude Code uses Braille spinner characters while working, ✳ when idle
-// Full Braille spinner cycle: ⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏ plus ⠐⠂
+const BRAILLE_CHARS = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠐⠂⠒";
 const EMOJI_STATES: [string, AgentState][] = [
-  // Braille spinner = running (Claude is working)
-  ["⠋", "running"], ["⠙", "running"], ["⠹", "running"], ["⠸", "running"],
-  ["⠼", "running"], ["⠴", "running"], ["⠦", "running"], ["⠧", "running"],
-  ["⠇", "running"], ["⠏", "running"], ["⠐", "running"], ["⠂", "running"],
-  ["⠒", "running"],
-  // Hourglass
+  ...BRAILLE_CHARS.split("").map((c): [string, AgentState] => [c, "running"]),
   ["⏳", "running"],
-  // Idle (Claude finished, waiting at prompt — not actively asking a question)
   ["✳", "done"],
   ["🔔", "waiting-input"],
-  // Done
   ["⏸", "done"],
 ];
 
@@ -110,22 +101,19 @@ function classifyFromTitle(title: string): AgentState {
   return "unknown";
 }
 
-/** Extract a readable name from the tab title by stripping emoji prefix */
+const STRIP_RE = new RegExp(`^[\\s${BRAILLE_CHARS}⏳✳🔔⏸]+`);
+
 function nameFromTabTitle(title: string): string {
-  // Strip leading emoji/Braille characters and whitespace
-  let name = title.replace(/^[\s⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏⠐⠂⠒⏳✳🔔⏸]+/, "").trim();
-  // If what's left is just "Claude Code", use the cwd-based name
+  let name = title.replace(STRIP_RE, "").trim();
   if (!name || name === "Claude Code") return "";
-  // Truncate long names
   if (name.length > 40) name = name.slice(0, 37) + "...";
   return name;
 }
 
-// ── Auto-approve logic ──
+// ── Auto-approve ──
 
 function shouldAutoApprove(agent: AgentInfo): boolean {
   if (agent.toolName && SAFE_TOOLS.includes(agent.toolName)) return true;
-
   if (agent.toolName === "Bash" && agent.toolInput?.command) {
     const cmd = (agent.toolInput.command as string).trim();
     for (const c of BASH_DENY_CHARS) {
@@ -133,7 +121,6 @@ function shouldAutoApprove(agent: AgentInfo): boolean {
     }
     return SAFE_BASH.includes(cmd);
   }
-
   return false;
 }
 
@@ -196,10 +183,9 @@ function processHookEvent(event: HookEvent): void {
   }
 
   agents.set(event.session_id, agent);
-  hooksActive = true;
 }
 
-// ── Process tab polling (fallback) ──
+// ── Process tab polling ──
 
 function processTabPoll(tabs: TerminalTab[]): void {
   const now = Date.now();
@@ -208,23 +194,27 @@ function processTabPoll(tabs: TerminalTab[]): void {
   for (const tab of tabs) {
     seenTerminals.add(tab.terminal_id);
 
-    // If already tracked via hooks, just update terminal ID
     const hookAgent = Array.from(agents.values()).find(
       (a) => a.detectionMethod === "hook" && a.cwd === tab.working_directory
     );
     if (hookAgent) {
       hookAgent.terminalId = tab.terminal_id;
+      // Also update name from tab title if hook agent has a generic name
+      const titleName = nameFromTabTitle(tab.tab_name);
+      if (titleName && (hookAgent.name === agentNameFromCwd(hookAgent.cwd))) {
+        hookAgent.name = titleName;
+      }
       continue;
     }
 
     const state = classifyFromTitle(tab.tab_name);
-    if (state === "unknown") continue; // Only show tabs we can classify via emoji
+    if (state === "unknown") continue;
 
     const pollId = `poll-${tab.terminal_id}`;
     const existing = agents.get(pollId);
     const prevState = existing?.state;
-
     const titleName = nameFromTabTitle(tab.tab_name);
+
     const agent: AgentInfo = existing || {
       sessionId: pollId,
       name: titleName || agentNameFromCwd(tab.working_directory),
@@ -237,7 +227,6 @@ function processTabPoll(tabs: TerminalTab[]): void {
       detectionMethod: "polling",
     };
 
-    // Update name from tab title (it can change as Claude works)
     if (titleName) agent.name = titleName;
     agent.state = state === "unknown" ? agent.state : state;
     agent.terminalId = tab.terminal_id;
@@ -250,15 +239,12 @@ function processTabPoll(tabs: TerminalTab[]): void {
     agents.set(pollId, agent);
   }
 
-  // Remove agents whose tabs are gone
   for (const [id, agent] of agents) {
     if (agent.terminalId && !seenTerminals.has(agent.terminalId)) {
       agents.delete(id);
     }
   }
 }
-
-// ── Match hook agents to terminal tabs ──
 
 function matchAgentsToTabs(tabs: TerminalTab[]): void {
   for (const agent of agents.values()) {
@@ -302,6 +288,15 @@ async function handleAutoApprove(agent: AgentInfo): Promise<void> {
   }
 }
 
+async function focusAgent(terminalId: string): Promise<void> {
+  if (!terminalId) return;
+  try {
+    await invoke("focus_tab", { terminal_id: terminalId });
+  } catch (e) {
+    console.error("Focus failed:", e);
+  }
+}
+
 async function focusNextWaiting(): Promise<void> {
   const queue = getQueue();
   if (queue.length === 0) return;
@@ -309,13 +304,13 @@ async function focusNextWaiting(): Promise<void> {
   const next = queue[0];
   if (!next.terminalId) return;
 
+  await focusAgent(next.terminalId);
   try {
-    await invoke("focus_tab", { terminal_id: next.terminalId });
     await invoke("play_sound", {
       sound_type: next.state === "waiting-approval" ? "needs-approval" : "needs-input",
     });
-  } catch (e) {
-    console.error("Focus failed:", e);
+  } catch {
+    // audio non-critical
   }
 }
 
@@ -325,15 +320,13 @@ function getQueue(): AgentInfo[] {
   return Array.from(agents.values())
     .filter((a) => a.state === "waiting-input" || a.state === "waiting-approval")
     .sort((a, b) => {
-      // Destructive approval first
       if (a.state === "waiting-approval" && b.state !== "waiting-approval") return -1;
       if (b.state === "waiting-approval" && a.state !== "waiting-approval") return 1;
-      // Then FIFO
       return a.stateChangedAt - b.stateChangedAt;
     });
 }
 
-// ── Rendering ──
+// ── Rendering (diff-based to avoid flicker) ──
 
 function dotClass(state: AgentState): string {
   switch (state) {
@@ -346,8 +339,8 @@ function dotClass(state: AgentState): string {
   }
 }
 
-function stateLabel(agent: AgentInfo): string {
-  switch (agent.state) {
+function stateLabel(state: AgentState): string {
+  switch (state) {
     case "running": return "Running";
     case "waiting-input": return "Waiting for input";
     case "waiting-approval": return "Needs approval";
@@ -371,7 +364,7 @@ function escHtml(t: string): string {
   return d.innerHTML;
 }
 
-function badge(agent: AgentInfo): string {
+function badgeHtml(agent: AgentInfo): string {
   if (agent.state === "waiting-approval")
     return '<div class="badge badge-destructive">DESTRUCTIVE</div>';
   if (agent.autoApproveCount > 0)
@@ -383,60 +376,151 @@ function badge(agent: AgentInfo): string {
   return "";
 }
 
-function renderAgent(agent: AgentInfo): string {
+/**
+ * Diff-based rendering: update existing DOM elements in-place instead of
+ * replacing innerHTML every tick. This eliminates the blinking/flashing.
+ */
+
+// Generate a stable key for an agent
+function agentKey(agent: AgentInfo): string {
+  return agent.sessionId;
+}
+
+function createAgentEl(agent: AgentInfo): HTMLElement {
+  const row = document.createElement("div");
+  row.className = "agent-row";
+  row.dataset.key = agentKey(agent);
+  row.addEventListener("click", () => focusAgent(agent.terminalId || ""));
+  updateAgentEl(row, agent);
+  return row;
+}
+
+function updateAgentEl(row: HTMLElement, agent: AgentInfo): void {
+  // Update classes
   const classes = ["agent-row"];
   if (agent.state === "waiting-input") classes.push("waiting");
   if (agent.state === "waiting-approval") classes.push("destructive");
   if (agent.state === "stale") classes.push("stale");
+  row.className = classes.join(" ");
 
   const preview = agent.message
     ? `<div class="agent-preview">${escHtml(agent.message)}</div>`
     : "";
 
-  return `
-    <div class="${classes.join(" ")}" data-terminal="${agent.terminalId || ""}" onclick="window._focusAgent('${agent.terminalId || ""}')">
-      <div class="agent-dot"><span class="dot ${dotClass(agent.state)}"></span></div>
-      <div class="agent-info">
-        <div class="agent-name">${escHtml(agent.name)}</div>
-        <div class="agent-status">${stateLabel(agent)}</div>
-        ${preview}
-      </div>
-      <div class="agent-meta">
-        <div class="agent-time">${agent.state === "done" ? "—" : timeAgo(agent.stateChangedAt)}</div>
-        ${badge(agent)}
-      </div>
+  const newHtml = `
+    <div class="agent-dot"><span class="dot ${dotClass(agent.state)}"></span></div>
+    <div class="agent-info">
+      <div class="agent-name">${escHtml(agent.name)}</div>
+      <div class="agent-status">${stateLabel(agent.state)}</div>
+      ${preview}
+    </div>
+    <div class="agent-meta">
+      <div class="agent-time">${agent.state === "done" ? "—" : timeAgo(agent.stateChangedAt)}</div>
+      ${badgeHtml(agent)}
     </div>`;
+
+  // Only update innerHTML if content actually changed (skip time-only changes for most ticks)
+  const currentHash = row.dataset.hash;
+  // Hash excludes time to reduce unnecessary repaints
+  const stableHash = `${agent.name}|${agent.state}|${agent.message || ""}|${agent.autoApproveCount}|${agent.detectionMethod}`;
+
+  if (currentHash !== stableHash) {
+    row.innerHTML = newHtml;
+    row.dataset.hash = stableHash;
+    // Re-attach click handler since innerHTML was replaced
+    row.onclick = () => focusAgent(agent.terminalId || "");
+  } else {
+    // Just update the time element
+    const timeEl = row.querySelector(".agent-time");
+    if (timeEl) {
+      const newTime = agent.state === "done" ? "—" : timeAgo(agent.stateChangedAt);
+      if (timeEl.textContent !== newTime) {
+        timeEl.textContent = newTime;
+      }
+    }
+  }
 }
 
-function renderQueue(queue: AgentInfo[]): string {
-  return queue
-    .map(
-      (a, i) => `
-    <div class="queue-item" onclick="window._focusAgent('${a.terminalId || ""}')">
-      <span class="queue-num">${i + 1}</span>
-      <span class="dot ${dotClass(a.state)}"></span>
-      <span>${escHtml(a.name)} — ${escHtml(a.message || "waiting")}</span>
-    </div>`
-    )
-    .join("");
+function renderAgentList(sortedAgents: AgentInfo[]): void {
+  const existingRows = new Map<string, HTMLElement>();
+  for (const child of Array.from(agentListEl.children) as HTMLElement[]) {
+    const key = child.dataset.key;
+    if (key) existingRows.set(key, child);
+  }
+
+  const newKeys = sortedAgents.map(agentKey);
+  const currentKeys = Array.from(existingRows.keys());
+
+  // Remove rows that no longer exist
+  for (const key of currentKeys) {
+    if (!newKeys.includes(key)) {
+      existingRows.get(key)!.remove();
+      existingRows.delete(key);
+    }
+  }
+
+  // Update or insert rows in correct order
+  let prevEl: HTMLElement | null = null;
+  for (const agent of sortedAgents) {
+    const key = agentKey(agent);
+    let row = existingRows.get(key);
+
+    if (row) {
+      updateAgentEl(row, agent);
+    } else {
+      row = createAgentEl(agent);
+      existingRows.set(key, row);
+    }
+
+    // Ensure correct order
+    const expectedNext = prevEl ? prevEl.nextElementSibling : agentListEl.firstElementChild;
+    if (expectedNext !== row) {
+      if (prevEl) {
+        prevEl.after(row);
+      } else {
+        agentListEl.prepend(row);
+      }
+    }
+
+    prevEl = row;
+  }
+}
+
+function renderQueueList(queue: AgentInfo[]): void {
+  // Queue is small (0-3 items typically), innerHTML is fine
+  if (queue.length > 0) {
+    queueSectionEl.classList.remove("hidden");
+    queueListEl.innerHTML = queue
+      .map(
+        (a, i) => `
+      <div class="queue-item" data-tid="${a.terminalId || ""}">
+        <span class="queue-num">${i + 1}</span>
+        <span class="dot ${dotClass(a.state)}"></span>
+        <span>${escHtml(a.name)} — ${escHtml(a.message || "waiting")}</span>
+      </div>`
+      )
+      .join("");
+    // Attach click handlers
+    for (const item of Array.from(queueListEl.querySelectorAll(".queue-item")) as HTMLElement[]) {
+      const tid = item.dataset.tid;
+      if (tid) item.addEventListener("click", () => focusAgent(tid));
+    }
+  } else {
+    queueSectionEl.classList.add("hidden");
+  }
 }
 
 function render(): void {
   const all = Array.from(agents.values());
   const queue = getQueue();
 
-  if (queue.length > 0) {
-    queueSectionEl.classList.remove("hidden");
-    queueListEl.innerHTML = renderQueue(queue);
-  } else {
-    queueSectionEl.classList.add("hidden");
-  }
+  renderQueueList(queue);
 
   if (all.length > 0) {
     emptyStateEl.classList.add("hidden");
     agentListEl.style.display = "";
-    // Sort: waiting-approval first, then waiting-input, then running, then done, then stale
-    const sorted = all.sort((a, b) => {
+
+    const sorted = [...all].sort((a, b) => {
       const order: Record<AgentState, number> = {
         "waiting-approval": 0,
         "waiting-input": 1,
@@ -447,7 +531,8 @@ function render(): void {
       };
       return (order[a.state] ?? 3) - (order[b.state] ?? 3);
     });
-    agentListEl.innerHTML = sorted.map(renderAgent).join("");
+
+    renderAgentList(sorted);
   } else {
     emptyStateEl.classList.remove("hidden");
     emptyStateEl.querySelector(".empty-title")!.textContent = ghosttyAvailable
@@ -470,24 +555,12 @@ function render(): void {
   statDone.innerHTML = `<span class="dot dot-gray"></span> ${done} done`;
 }
 
-// ── Click handler for agent focus ──
-
-(window as any)._focusAgent = async (terminalId: string) => {
-  if (!terminalId) return;
-  try {
-    await invoke("focus_tab", { terminal_id: terminalId });
-  } catch (e) {
-    console.error("Focus failed:", e);
-  }
-};
-
 // ── Main loop ──
 
 let previousWaitingCount = 0;
 
 async function tick(): Promise<void> {
   try {
-    // 1. Check Ghostty
     ghosttyAvailable = (await invoke("check_ghostty_running")) as boolean;
 
     if (!ghosttyAvailable) {
@@ -496,35 +569,28 @@ async function tick(): Promise<void> {
       return;
     }
 
-    // 2. Read hook events (immediate, rich)
     const events = (await invoke("read_hook_events")) as HookEvent[];
     for (const event of events) {
       processHookEvent(event);
     }
 
-    // 3. Poll tabs (fallback + terminal ID matching)
     const tabs = (await invoke("list_ghostty_tabs")) as TerminalTab[];
     processTabPoll(tabs);
     matchAgentsToTabs(tabs);
-
-    // 4. Stale detection
     detectStale();
 
-    // 5. Auto-approve safe operations
     for (const agent of agents.values()) {
       if (agent.state === "waiting-approval") {
         await handleAutoApprove(agent);
       }
     }
 
-    // 6. Auto-focus if new waiting agents appeared
     const currentWaiting = getQueue().length;
     if (currentWaiting > previousWaitingCount && currentWaiting > 0) {
       await focusNextWaiting();
     }
     previousWaitingCount = currentWaiting;
 
-    // 7. Render
     render();
   } catch (e) {
     console.error("Tick error:", e);
@@ -532,14 +598,8 @@ async function tick(): Promise<void> {
   }
 }
 
-// ── Start ──
-
 async function init(): Promise<void> {
-  try {
-    await invoke("ensure_hook_dir");
-  } catch {
-    // Non-critical
-  }
+  try { await invoke("ensure_hook_dir"); } catch { /* non-critical */ }
   render();
   setInterval(tick, POLL_INTERVAL);
   tick();

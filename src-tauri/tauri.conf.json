@@ -15,7 +15,7 @@
         "title": "Claude Command Center",
         "width": 300,
         "height": 800,
-        "resizable": false,
+        "resizable": true,
         "decorations": false,
         "transparent": false,
         "alwaysOnTop": true,
