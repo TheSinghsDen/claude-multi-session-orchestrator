@@ -299,16 +299,9 @@ async function handleAutoApprove(agent: AgentInfo): Promise<void> {
 async function focusAgent(terminalId: string): Promise<void> {
   if (!terminalId) return;
   try {
-    const result = await invoke("focus_tab", { terminalId: terminalId });
-    console.log("focus_tab result:", result);
-  } catch (e: any) {
-    console.error("focus_tab FAILED:", e);
-    // Show error visually so we can see it
-    const errEl = document.createElement("div");
-    errEl.style.cssText = "position:fixed;top:0;left:0;right:0;padding:8px;background:#f38ba8;color:#000;font-size:11px;z-index:999;";
-    errEl.textContent = `focus_tab error: ${e?.message || e}`;
-    document.body.appendChild(errEl);
-    setTimeout(() => errEl.remove(), 5000);
+    await invoke("focus_tab", { terminalId });
+  } catch (e) {
+    console.error("focus_tab failed:", e);
   }
 }
 
