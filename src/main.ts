@@ -1,19 +1,78 @@
 /**
- * main.ts — Frontend entry point for Claude Command Center overlay
+ * main.ts — Frontend for Claude Command Center
  *
- * Renders the agent list, queue, and summary from agent-monitor state.
- * Communicates with the Tauri backend via invoke/events.
+ * Polls Ghostty tabs and hook events via Tauri commands.
+ * Manages agent state, renders the overlay, handles auto-approve.
  */
 
-import type { AgentInfo } from "./lib/agent-monitor.js";
+declare function __TAURI_INVOKE__(cmd: string, args?: Record<string, unknown>): Promise<unknown>;
+
+// Use Tauri's invoke directly (available in webview context)
+const invoke = (window as any).__TAURI_INTERNALS__?.invoke
+  ?? (async (cmd: string, args?: Record<string, unknown>) => {
+    // Fallback for dev: use fetch to Tauri IPC
+    return (window as any).__TAURI_INVOKE__?.(cmd, args);
+  });
+
+// ── Types ──
+
+interface TerminalTab {
+  tab_index: number;
+  tab_name: string;
+  terminal_id: string;
+  working_directory: string;
+}
+
+interface HookEvent {
+  session_id: string;
+  event_type: string;
+  tool_name?: string;
+  payload?: Record<string, unknown>;
+  timestamp: string;
+  cwd?: string;
+}
+
+type AgentState =
+  | "running"
+  | "waiting-input"
+  | "waiting-approval"
+  | "done"
+  | "stale"
+  | "unknown";
+
+interface AgentInfo {
+  sessionId: string;
+  name: string;
+  cwd: string;
+  state: AgentState;
+  terminalId?: string;
+  lastEventTime: number;
+  stateChangedAt: number;
+  message?: string;
+  toolName?: string;
+  toolInput?: Record<string, unknown>;
+  autoApproveCount: number;
+  detectionMethod: "hook" | "polling";
+}
+
+// ── Config ──
+
+const SAFE_TOOLS = ["Read", "Glob", "Grep", "WebSearch", "WebFetch", "Skill"];
+const SAFE_BASH = [
+  "git status", "git diff", "git log", "git branch",
+  "ls", "pwd", "which", "wc",
+];
+const BASH_DENY_CHARS = [";", "&&", "||", "|", "`", "$("];
+const POLL_INTERVAL = 2000;
+const STALE_TIMEOUT = 5 * 60 * 1000;
 
 // ── State ──
 
-let agents: AgentInfo[] = [];
-let queue: AgentInfo[] = [];
-let activeAgentId: string | null = null;
+const agents = new Map<string, AgentInfo>();
+let ghosttyAvailable = false;
+let hooksActive = false;
 
-// ── DOM references ──
+// ── DOM ──
 
 const agentListEl = document.getElementById("agent-list")!;
 const queueSectionEl = document.getElementById("queue-section")!;
@@ -23,241 +82,456 @@ const statRunning = document.getElementById("stat-running")!;
 const statWaiting = document.getElementById("stat-waiting")!;
 const statDone = document.getElementById("stat-done")!;
 
+// ── Agent name from cwd ──
+
+function agentNameFromCwd(cwd: string): string {
+  const parts = cwd.split("/").filter(Boolean);
+  const agentsIdx = parts.indexOf("agents");
+  if (agentsIdx >= 0 && agentsIdx + 1 < parts.length) return parts[agentsIdx + 1];
+  return parts[parts.length - 1] || "unknown";
+}
+
+// ── Tab title emoji → state ──
+
+const EMOJI_STATES: [string, AgentState][] = [
+  ["⏳", "running"],
+  ["⠐", "running"],
+  ["⠒", "running"],
+  ["⠇", "running"],
+  ["⠋", "running"],
+  ["⠙", "running"],
+  ["⠸", "running"],
+  ["⠴", "running"],
+  ["⠦", "running"],
+  ["✳", "waiting-input"],
+  ["🔔", "waiting-input"],
+  ["⏸", "done"],
+];
+
+function classifyFromTitle(title: string): AgentState {
+  for (const [emoji, state] of EMOJI_STATES) {
+    if (title.includes(emoji)) return state;
+  }
+  // Check if it looks like a Claude Code tab at all
+  if (title.toLowerCase().includes("claude")) return "unknown";
+  return "unknown";
+}
+
+// ── Auto-approve logic ──
+
+function shouldAutoApprove(agent: AgentInfo): boolean {
+  if (agent.toolName && SAFE_TOOLS.includes(agent.toolName)) return true;
+
+  if (agent.toolName === "Bash" && agent.toolInput?.command) {
+    const cmd = (agent.toolInput.command as string).trim();
+    for (const c of BASH_DENY_CHARS) {
+      if (cmd.includes(c)) return false;
+    }
+    return SAFE_BASH.includes(cmd);
+  }
+
+  return false;
+}
+
+// ── Process hook events ──
+
+function processHookEvent(event: HookEvent): void {
+  const now = Date.now();
+  const existing = agents.get(event.session_id);
+
+  const agent: AgentInfo = existing || {
+    sessionId: event.session_id,
+    name: agentNameFromCwd(event.cwd || ""),
+    cwd: event.cwd || "",
+    state: "unknown",
+    lastEventTime: now,
+    stateChangedAt: now,
+    autoApproveCount: 0,
+    detectionMethod: "hook",
+  };
+
+  agent.lastEventTime = now;
+  agent.detectionMethod = "hook";
+  if (event.cwd) {
+    agent.cwd = event.cwd;
+    agent.name = agentNameFromCwd(event.cwd);
+  }
+
+  const prevState = agent.state;
+
+  switch (event.event_type) {
+    case "SessionStart":
+      agent.state = "running";
+      break;
+    case "PermissionRequest":
+      agent.state = "waiting-approval";
+      agent.toolName = event.tool_name;
+      agent.toolInput = event.payload as Record<string, unknown>;
+      agent.message = `Needs permission: ${event.tool_name || "unknown"}`;
+      if (agent.toolInput?.command) {
+        agent.message += ` → ${(agent.toolInput.command as string).slice(0, 60)}`;
+      }
+      break;
+    case "PostToolUse":
+      agent.state = "running";
+      agent.message = undefined;
+      agent.toolName = undefined;
+      agent.toolInput = undefined;
+      break;
+    case "Stop":
+      agent.state = "done";
+      agent.message = undefined;
+      break;
+    case "UserPromptSubmit":
+      agent.state = "running";
+      break;
+  }
+
+  if (agent.state !== prevState) {
+    agent.stateChangedAt = now;
+  }
+
+  agents.set(event.session_id, agent);
+  hooksActive = true;
+}
+
+// ── Process tab polling (fallback) ──
+
+function processTabPoll(tabs: TerminalTab[]): void {
+  const now = Date.now();
+  const seenTerminals = new Set<string>();
+
+  for (const tab of tabs) {
+    seenTerminals.add(tab.terminal_id);
+
+    // If already tracked via hooks, just update terminal ID
+    const hookAgent = Array.from(agents.values()).find(
+      (a) => a.detectionMethod === "hook" && a.cwd === tab.working_directory
+    );
+    if (hookAgent) {
+      hookAgent.terminalId = tab.terminal_id;
+      continue;
+    }
+
+    const state = classifyFromTitle(tab.tab_name);
+    if (state === "unknown" && !tab.tab_name.toLowerCase().includes("claude")) continue;
+
+    const pollId = `poll-${tab.terminal_id}`;
+    const existing = agents.get(pollId);
+    const prevState = existing?.state;
+
+    const agent: AgentInfo = existing || {
+      sessionId: pollId,
+      name: agentNameFromCwd(tab.working_directory),
+      cwd: tab.working_directory,
+      state,
+      terminalId: tab.terminal_id,
+      lastEventTime: now,
+      stateChangedAt: now,
+      autoApproveCount: 0,
+      detectionMethod: "polling",
+    };
+
+    agent.state = state === "unknown" ? agent.state : state;
+    agent.terminalId = tab.terminal_id;
+    agent.lastEventTime = now;
+
+    if (agent.state !== prevState) {
+      agent.stateChangedAt = now;
+    }
+
+    agents.set(pollId, agent);
+  }
+
+  // Remove agents whose tabs are gone
+  for (const [id, agent] of agents) {
+    if (agent.terminalId && !seenTerminals.has(agent.terminalId)) {
+      agents.delete(id);
+    }
+  }
+}
+
+// ── Match hook agents to terminal tabs ──
+
+function matchAgentsToTabs(tabs: TerminalTab[]): void {
+  for (const agent of agents.values()) {
+    if (agent.detectionMethod === "hook" && !agent.terminalId) {
+      const match = tabs.find((t) => t.working_directory === agent.cwd);
+      if (match) agent.terminalId = match.terminal_id;
+    }
+  }
+}
+
+// ── Stale detection ──
+
+function detectStale(): void {
+  const now = Date.now();
+  for (const agent of agents.values()) {
+    if (agent.state === "running" && now - agent.lastEventTime > STALE_TIMEOUT) {
+      agent.state = "stale";
+      agent.stateChangedAt = now;
+      agent.message = "No activity for 5+ minutes";
+    }
+  }
+}
+
+// ── Auto-approve + focus switching ──
+
+async function handleAutoApprove(agent: AgentInfo): Promise<void> {
+  if (agent.state !== "waiting-approval") return;
+  if (!shouldAutoApprove(agent)) return;
+  if (!agent.terminalId) return;
+
+  try {
+    await invoke("send_input", { terminalId: agent.terminalId, text: "y\n" });
+    agent.autoApproveCount++;
+    agent.state = "running";
+    agent.stateChangedAt = Date.now();
+    agent.message = undefined;
+    agent.toolName = undefined;
+    agent.toolInput = undefined;
+  } catch (e) {
+    console.error("Auto-approve failed:", e);
+  }
+}
+
+async function focusNextWaiting(): Promise<void> {
+  const queue = getQueue();
+  if (queue.length === 0) return;
+
+  const next = queue[0];
+  if (!next.terminalId) return;
+
+  try {
+    await invoke("focus_tab", { terminalId: next.terminalId });
+    await invoke("play_sound", {
+      soundType: next.state === "waiting-approval" ? "needs-approval" : "needs-input",
+    });
+  } catch (e) {
+    console.error("Focus failed:", e);
+  }
+}
+
+// ── Queue ──
+
+function getQueue(): AgentInfo[] {
+  return Array.from(agents.values())
+    .filter((a) => a.state === "waiting-input" || a.state === "waiting-approval")
+    .sort((a, b) => {
+      // Destructive approval first
+      if (a.state === "waiting-approval" && b.state !== "waiting-approval") return -1;
+      if (b.state === "waiting-approval" && a.state !== "waiting-approval") return 1;
+      // Then FIFO
+      return a.stateChangedAt - b.stateChangedAt;
+    });
+}
+
 // ── Rendering ──
 
-function dotClass(state: AgentInfo["state"]): string {
+function dotClass(state: AgentState): string {
   switch (state) {
-    case "running":
-      return "dot-green";
-    case "waiting-input":
-      return "dot-yellow";
-    case "waiting-approval":
-      return "dot-red";
-    case "stale":
-      return "dot-orange";
-    case "done":
-      return "dot-gray";
-    default:
-      return "dot-gray";
+    case "running": return "dot-green";
+    case "waiting-input": return "dot-yellow";
+    case "waiting-approval": return "dot-red";
+    case "stale": return "dot-orange";
+    case "done": return "dot-gray";
+    default: return "dot-gray";
   }
 }
 
 function stateLabel(agent: AgentInfo): string {
   switch (agent.state) {
-    case "running":
-      return "Running";
-    case "waiting-input":
-      return "Waiting for input";
-    case "waiting-approval":
-      return "Needs approval";
-    case "stale":
-      return "Stale — no activity 5m+";
-    case "done":
-      return "Done";
-    default:
-      return "Unknown";
+    case "running": return "Running";
+    case "waiting-input": return "Waiting for input";
+    case "waiting-approval": return "Needs approval";
+    case "stale": return "Stale — no activity 5m+";
+    case "done": return "Done";
+    default: return "Unknown";
   }
 }
 
-function rowClasses(agent: AgentInfo): string {
-  const classes = ["agent-row"];
-  if (agent.sessionId === activeAgentId) classes.push("active");
-  if (agent.state === "waiting-input") classes.push("waiting");
-  if (agent.state === "waiting-approval") classes.push("destructive");
-  if (agent.state === "stale") classes.push("stale");
-  return classes.join(" ");
+function timeAgo(ts: number): string {
+  const s = Math.floor((Date.now() - ts) / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m`;
+  return `${Math.floor(m / 60)}h`;
 }
 
-function timeAgo(timestamp: number): string {
-  const seconds = Math.floor((Date.now() - timestamp) / 1000);
-  if (seconds < 60) return `${seconds}s`;
-  const minutes = Math.floor(seconds / 60);
-  if (minutes < 60) return `${minutes}m`;
-  return `${Math.floor(minutes / 60)}h`;
+function escHtml(t: string): string {
+  const d = document.createElement("div");
+  d.textContent = t;
+  return d.innerHTML;
 }
 
-function renderBadge(agent: AgentInfo): string {
-  if (agent.state === "waiting-approval") {
+function badge(agent: AgentInfo): string {
+  if (agent.state === "waiting-approval")
     return '<div class="badge badge-destructive">DESTRUCTIVE</div>';
-  }
-  if (agent.autoApproveCount > 0) {
+  if (agent.autoApproveCount > 0)
     return `<div class="badge badge-auto">${agent.autoApproveCount} auto</div>`;
-  }
-  if (agent.state === "stale") {
+  if (agent.state === "stale")
     return '<div class="badge badge-stale">?</div>';
-  }
-  if (agent.detectionMethod === "hook") {
-    return '<div class="badge badge-hook">via hook</div>';
-  }
+  if (agent.detectionMethod === "hook")
+    return '<div class="badge badge-hook">hook</div>';
   return "";
 }
 
-function renderAgentRow(agent: AgentInfo): string {
+function renderAgent(agent: AgentInfo): string {
+  const classes = ["agent-row"];
+  if (agent.state === "waiting-input") classes.push("waiting");
+  if (agent.state === "waiting-approval") classes.push("destructive");
+  if (agent.state === "stale") classes.push("stale");
+
   const preview = agent.message
-    ? `<div class="agent-preview">${escapeHtml(agent.message)}</div>`
+    ? `<div class="agent-preview">${escHtml(agent.message)}</div>`
     : "";
 
   return `
-    <div class="${rowClasses(agent)}" data-id="${agent.sessionId}">
+    <div class="${classes.join(" ")}" data-terminal="${agent.terminalId || ""}" onclick="window._focusAgent('${agent.terminalId || ""}')">
       <div class="agent-dot"><span class="dot ${dotClass(agent.state)}"></span></div>
       <div class="agent-info">
-        <div class="agent-name">${escapeHtml(agent.name)}</div>
+        <div class="agent-name">${escHtml(agent.name)}</div>
         <div class="agent-status">${stateLabel(agent)}</div>
         ${preview}
       </div>
       <div class="agent-meta">
         <div class="agent-time">${agent.state === "done" ? "—" : timeAgo(agent.stateChangedAt)}</div>
-        ${renderBadge(agent)}
+        ${badge(agent)}
       </div>
-    </div>
-  `;
+    </div>`;
 }
 
-function renderQueueItem(agent: AgentInfo, index: number): string {
-  return `
-    <div class="queue-item" data-id="${agent.sessionId}">
-      <span class="queue-num">${index + 1}</span>
-      <span class="dot ${dotClass(agent.state)}"></span>
-      <span>${escapeHtml(agent.name)} — ${escapeHtml(agent.message || "waiting")}</span>
-    </div>
-  `;
+function renderQueue(queue: AgentInfo[]): string {
+  return queue
+    .map(
+      (a, i) => `
+    <div class="queue-item" onclick="window._focusAgent('${a.terminalId || ""}')">
+      <span class="queue-num">${i + 1}</span>
+      <span class="dot ${dotClass(a.state)}"></span>
+      <span>${escHtml(a.name)} — ${escHtml(a.message || "waiting")}</span>
+    </div>`
+    )
+    .join("");
 }
 
 function render(): void {
-  // Queue
+  const all = Array.from(agents.values());
+  const queue = getQueue();
+
   if (queue.length > 0) {
     queueSectionEl.classList.remove("hidden");
-    queueListEl.innerHTML = queue
-      .map((a, i) => renderQueueItem(a, i))
-      .join("");
+    queueListEl.innerHTML = renderQueue(queue);
   } else {
     queueSectionEl.classList.add("hidden");
   }
 
-  // Agent list
-  if (agents.length > 0) {
+  if (all.length > 0) {
     emptyStateEl.classList.add("hidden");
-    agentListEl.innerHTML = agents.map(renderAgentRow).join("");
+    agentListEl.style.display = "";
+    // Sort: waiting-approval first, then waiting-input, then running, then done, then stale
+    const sorted = all.sort((a, b) => {
+      const order: Record<AgentState, number> = {
+        "waiting-approval": 0,
+        "waiting-input": 1,
+        "running": 2,
+        "unknown": 3,
+        "stale": 4,
+        "done": 5,
+      };
+      return (order[a.state] ?? 3) - (order[b.state] ?? 3);
+    });
+    agentListEl.innerHTML = sorted.map(renderAgent).join("");
   } else {
     emptyStateEl.classList.remove("hidden");
-    agentListEl.innerHTML = "";
+    emptyStateEl.querySelector(".empty-title")!.textContent = ghosttyAvailable
+      ? "No Claude Code sessions detected"
+      : "Ghostty not found";
+    emptyStateEl.querySelector(".empty-desc")!.textContent = ghosttyAvailable
+      ? "Open Claude Code in Ghostty and start a session."
+      : "Open Ghostty and start a Claude Code session. Checking every 2 seconds...";
+    agentListEl.style.display = "none";
   }
 
-  // Summary
-  const running = agents.filter(
-    (a) => a.state === "running"
-  ).length;
-  const waiting = agents.filter(
+  const running = all.filter((a) => a.state === "running").length;
+  const waiting = all.filter(
     (a) => a.state === "waiting-input" || a.state === "waiting-approval"
   ).length;
-  const done = agents.filter((a) => a.state === "done").length;
+  const done = all.filter((a) => a.state === "done").length;
 
   statRunning.innerHTML = `<span class="dot dot-green"></span> ${running} running`;
   statWaiting.innerHTML = `<span class="dot dot-yellow"></span> ${waiting} waiting`;
   statDone.innerHTML = `<span class="dot dot-gray"></span> ${done} done`;
 }
 
-function escapeHtml(text: string): string {
-  const div = document.createElement("div");
-  div.textContent = text;
-  return div.innerHTML;
-}
+// ── Click handler for agent focus ──
 
-// ── Demo data for development ──
+(window as any)._focusAgent = async (terminalId: string) => {
+  if (!terminalId) return;
+  try {
+    await invoke("focus_tab", { terminalId });
+  } catch (e) {
+    console.error("Focus failed:", e);
+  }
+};
 
-function loadDemoData(): void {
-  const now = Date.now();
-  agents = [
-    {
-      sessionId: "demo-1",
-      name: "ceo-agent",
-      cwd: "/agents/ceo",
-      state: "waiting-approval",
-      lastHookTime: now - 12000,
-      stateChangedAt: now - 12000,
-      message: 'git push origin main --force',
-      toolName: "Bash",
-      toolInput: { command: "git push origin main --force" },
-      autoApproveCount: 0,
-      detectionMethod: "hook",
-    },
-    {
-      sessionId: "demo-2",
-      name: "instagram-exec",
-      cwd: "/agents/instagram-executor",
-      state: "waiting-input",
-      lastHookTime: now - 45000,
-      stateChangedAt: now - 45000,
-      message: "Which variant do you prefer? A or B?",
-      autoApproveCount: 0,
-      detectionMethod: "hook",
-    },
-    {
-      sessionId: "demo-3",
-      name: "lead-enrichment",
-      cwd: "/agents/lead-enrichment",
-      state: "running",
-      lastHookTime: now - 120000,
-      stateChangedAt: now - 120000,
-      autoApproveCount: 3,
-      detectionMethod: "hook",
-    },
-    {
-      sessionId: "demo-4",
-      name: "slack-agent",
-      cwd: "/agents/slack",
-      state: "running",
-      lastHookTime: now - 300000,
-      stateChangedAt: now - 300000,
-      autoApproveCount: 0,
-      detectionMethod: "hook",
-    },
-    {
-      sessionId: "demo-5",
-      name: "x-content",
-      cwd: "/agents/x-content",
-      state: "running",
-      lastHookTime: now - 480000,
-      stateChangedAt: now - 480000,
-      autoApproveCount: 0,
-      detectionMethod: "polling",
-    },
-    {
-      sessionId: "demo-6",
-      name: "screening",
-      cwd: "/agents/screening",
-      state: "stale",
-      lastHookTime: now - 360000,
-      stateChangedAt: now - 60000,
-      message: "No activity for 5+ minutes",
-      autoApproveCount: 0,
-      detectionMethod: "hook",
-    },
-  ];
+// ── Main loop ──
 
-  queue = agents.filter(
-    (a) => a.state === "waiting-input" || a.state === "waiting-approval"
-  ).sort((a, b) => {
-    // Destructive first
-    if (a.state === "waiting-approval" && b.state !== "waiting-approval") return -1;
-    if (b.state === "waiting-approval" && a.state !== "waiting-approval") return 1;
-    return a.stateChangedAt - b.stateChangedAt;
-  });
+let previousWaitingCount = 0;
 
-  render();
-}
+async function tick(): Promise<void> {
+  try {
+    // 1. Check Ghostty
+    ghosttyAvailable = (await invoke("check_ghostty_running")) as boolean;
 
-// ── Init ──
-
-// For now, load demo data. Real integration will use Tauri events.
-loadDemoData();
-
-// Update time displays every second
-setInterval(() => {
-  const timeEls = document.querySelectorAll(".agent-time");
-  timeEls.forEach((el, i) => {
-    if (agents[i] && agents[i].state !== "done") {
-      el.textContent = timeAgo(agents[i].stateChangedAt);
+    if (!ghosttyAvailable) {
+      agents.clear();
+      render();
+      return;
     }
-  });
-}, 1000);
+
+    // 2. Read hook events (immediate, rich)
+    const events = (await invoke("read_hook_events")) as HookEvent[];
+    for (const event of events) {
+      processHookEvent(event);
+    }
+
+    // 3. Poll tabs (fallback + terminal ID matching)
+    const tabs = (await invoke("list_ghostty_tabs")) as TerminalTab[];
+    processTabPoll(tabs);
+    matchAgentsToTabs(tabs);
+
+    // 4. Stale detection
+    detectStale();
+
+    // 5. Auto-approve safe operations
+    for (const agent of agents.values()) {
+      if (agent.state === "waiting-approval") {
+        await handleAutoApprove(agent);
+      }
+    }
+
+    // 6. Auto-focus if new waiting agents appeared
+    const currentWaiting = getQueue().length;
+    if (currentWaiting > previousWaitingCount && currentWaiting > 0) {
+      await focusNextWaiting();
+    }
+    previousWaitingCount = currentWaiting;
+
+    // 7. Render
+    render();
+  } catch (e) {
+    console.error("Tick error:", e);
+    render();
+  }
+}
+
+// ── Start ──
+
+async function init(): Promise<void> {
+  await invoke("ensure_hook_dir");
+  render(); // Initial empty render
+  setInterval(tick, POLL_INTERVAL);
+  tick(); // First tick immediately
+}
+
+init();
