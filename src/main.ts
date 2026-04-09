@@ -23,6 +23,12 @@ interface HookEvent {
   payload?: Record<string, unknown>;
   timestamp: string;
   cwd?: string;
+  tty?: string;
+}
+
+interface TtyMapping {
+  tty: string;
+  terminal_id: string;
 }
 
 type AgentState =
@@ -39,6 +45,7 @@ interface AgentInfo {
   cwd: string;
   state: AgentState;
   terminalId?: string;
+  tty?: string; // TTY device from hook (e.g., "ttys003")
   lastEventTime: number;
   stateChangedAt: number;
   message?: string;
@@ -147,6 +154,9 @@ function processHookEvent(event: HookEvent): void {
     agent.cwd = event.cwd;
     agent.name = agentNameFromCwd(event.cwd);
   }
+  if (event.tty) {
+    agent.tty = event.tty;
+  }
 
   const prevState = agent.state;
 
@@ -246,43 +256,56 @@ function processTabPoll(tabs: TerminalTab[]): void {
   }
 }
 
+// TTY map cache — refreshed periodically
+let ttyMap: TtyMapping[] = [];
+let ttyMapLastRefresh = 0;
+const TTY_MAP_REFRESH_INTERVAL = 10000; // 10 seconds
+
+async function refreshTtyMap(): Promise<void> {
+  const now = Date.now();
+  if (now - ttyMapLastRefresh < TTY_MAP_REFRESH_INTERVAL) return;
+  try {
+    ttyMap = (await invoke("get_tty_map")) as TtyMapping[];
+    ttyMapLastRefresh = now;
+  } catch {
+    // Non-critical
+  }
+}
+
 function matchAgentsToTabs(tabs: TerminalTab[]): void {
-  // Build a set of terminalIds already claimed by any agent
   const claimedTerminals = new Set<string>();
   for (const agent of agents.values()) {
     if (agent.terminalId) claimedTerminals.add(agent.terminalId);
   }
 
   for (const agent of agents.values()) {
-    if (agent.detectionMethod === "hook" && !agent.terminalId) {
-      // Find tabs matching this agent's cwd that aren't already claimed
+    if (agent.detectionMethod !== "hook" || agent.terminalId) continue;
+
+    let matchedTerminalId: string | undefined;
+
+    // Strategy 1: Match via TTY (precise, no ambiguity)
+    if (agent.tty) {
+      const ttyEntry = ttyMap.find((m) => m.tty === agent.tty);
+      if (ttyEntry && !claimedTerminals.has(ttyEntry.terminal_id)) {
+        matchedTerminalId = ttyEntry.terminal_id;
+      }
+    }
+
+    // Strategy 2: Fall back to cwd match (only if unambiguous)
+    if (!matchedTerminalId) {
       const cwdMatches = tabs.filter(
         (t) => t.working_directory === agent.cwd && !claimedTerminals.has(t.terminal_id)
       );
-
-      let match: TerminalTab | undefined;
-
       if (cwdMatches.length === 1) {
-        match = cwdMatches[0];
-      } else if (cwdMatches.length > 1) {
-        // Ambiguous: multiple tabs with same cwd. Prefer the one that's
-        // actively running (Braille spinner), since the hook just fired
-        // meaning that session is working, not idle.
-        match = cwdMatches.find((t) => {
-          const state = classifyFromTitle(t.tab_name);
-          return state === "running";
-        }) || cwdMatches[0]; // fallback to first
+        matchedTerminalId = cwdMatches[0].terminal_id;
       }
+    }
 
-      if (match) {
-        agent.terminalId = match.terminal_id;
-        claimedTerminals.add(match.terminal_id);
-        // Remove any duplicate poll entry
-        const pollId = `poll-${match.terminal_id}`;
-        if (agents.has(pollId)) {
-          agents.delete(pollId);
-        }
-      }
+    if (matchedTerminalId) {
+      agent.terminalId = matchedTerminalId;
+      claimedTerminals.add(matchedTerminalId);
+      const pollId = `poll-${matchedTerminalId}`;
+      if (agents.has(pollId)) agents.delete(pollId);
     }
   }
 }
@@ -614,6 +637,7 @@ async function tick(): Promise<void> {
 
     const tabs = (await invoke("list_ghostty_tabs")) as TerminalTab[];
     processTabPoll(tabs);
+    await refreshTtyMap();
     matchAgentsToTabs(tabs);
     detectStale();
 

@@ -22,6 +22,13 @@ pub struct HookEvent {
     pub payload: Option<serde_json::Value>,
     pub timestamp: String,
     pub cwd: Option<String>,
+    pub tty: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TtyMapping {
+    pub tty: String,
+    pub terminal_id: String,
 }
 
 // ── Tauri Commands ──
@@ -227,6 +234,108 @@ fn ensure_hook_dir() -> Result<(), String> {
     fs::create_dir_all("/tmp/cc-state").map_err(|e| format!("Failed to create hook dir: {}", e))
 }
 
+/// Build a map of TTY device → Ghostty terminal_id.
+/// Uses `ps` to find shell processes whose grandparent is Ghostty,
+/// then matches their TTY to the Ghostty terminal by correlating
+/// the shell's cwd with the terminal's working_directory.
+#[tauri::command]
+fn get_tty_map() -> Result<Vec<TtyMapping>, String> {
+    // Step 1: Get Ghostty's PID
+    let ghostty_pid_output = Command::new("pgrep")
+        .arg("-x")
+        .arg("Ghostty")
+        .output()
+        .map_err(|e| format!("pgrep failed: {}", e))?;
+
+    let ghostty_pid = String::from_utf8_lossy(&ghostty_pid_output.stdout)
+        .trim()
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+
+    if ghostty_pid.is_empty() {
+        return Ok(vec![]);
+    }
+
+    // Step 2: Find all shell processes under Ghostty with their TTY and CWD
+    // ps output: PID TTY PPID COMMAND
+    let ps_output = Command::new("ps")
+        .args(["-eo", "pid,tty,ppid,args"])
+        .output()
+        .map_err(|e| format!("ps failed: {}", e))?;
+
+    let ps_text = String::from_utf8_lossy(&ps_output.stdout);
+
+    // Find shells whose parent's parent is Ghostty (login → shell)
+    // Or whose parent is Ghostty directly
+    let mut tty_to_cwd: Vec<(String, String)> = Vec::new();
+
+    for line in ps_text.lines().skip(1) {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() < 4 {
+            continue;
+        }
+        let pid = parts[0];
+        let tty = parts[1];
+        let ppid = parts[2];
+
+        if tty == "??" || !tty.starts_with("ttys") {
+            continue;
+        }
+
+        // Check if this is a shell whose grandparent is Ghostty
+        // (Ghostty → login → shell) or parent is Ghostty
+        let gppid_output = Command::new("ps")
+            .args(["-o", "ppid=", "-p", ppid])
+            .output();
+
+        let is_ghostty_child = ppid == ghostty_pid;
+        let is_ghostty_grandchild = match &gppid_output {
+            Ok(o) => String::from_utf8_lossy(&o.stdout).trim() == ghostty_pid,
+            Err(_) => false,
+        };
+
+        if is_ghostty_child || is_ghostty_grandchild {
+            // Get this process's cwd via lsof
+            let lsof_output = Command::new("lsof")
+                .args(["-a", "-p", pid, "-d", "cwd", "-Fn"])
+                .output();
+
+            if let Ok(lo) = lsof_output {
+                let lsof_text = String::from_utf8_lossy(&lo.stdout);
+                for l in lsof_text.lines() {
+                    if l.starts_with('n') && l.len() > 1 {
+                        tty_to_cwd.push((tty.to_string(), l[1..].to_string()));
+                    }
+                }
+            }
+        }
+    }
+
+    // Step 3: Get Ghostty terminals with their working directories
+    let tabs = list_ghostty_tabs().unwrap_or_default();
+
+    // Step 4: Match TTY → terminal_id via cwd correlation
+    let mut mappings: Vec<TtyMapping> = Vec::new();
+    let mut claimed_terminals: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    for (tty, cwd) in &tty_to_cwd {
+        // Find a terminal with matching cwd that isn't already claimed
+        if let Some(tab) = tabs.iter().find(|t| {
+            t.working_directory == *cwd && !claimed_terminals.contains(&t.terminal_id)
+        }) {
+            mappings.push(TtyMapping {
+                tty: tty.clone(),
+                terminal_id: tab.terminal_id.clone(),
+            });
+            claimed_terminals.insert(tab.terminal_id.clone());
+        }
+    }
+
+    Ok(mappings)
+}
+
 #[tauri::command]
 fn start_drag(window: tauri::WebviewWindow) -> Result<(), String> {
     window.start_dragging().map_err(|e| format!("Drag failed: {}", e))
@@ -247,6 +356,7 @@ pub fn run() {
             check_ghostty_running,
             ensure_hook_dir,
             start_drag,
+            get_tty_map,
         ])
         .setup(|app| {
             // Position sidebar on the right edge of the screen
